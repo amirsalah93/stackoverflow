@@ -4,11 +4,17 @@ import org.apache.spark.SparkConf
 import org.apache.spark.SparkContext
 import org.apache.spark.SparkContext._
 import org.apache.spark.rdd.RDD
+
 import annotation.tailrec
+import scala.collection
 import scala.reflect.ClassTag
 
 /** A raw stackoverflow posting, either a question or an answer */
-case class Posting(postingType: Int, id: Int, acceptedAnswer: Option[Int], parentId: Option[QID], score: Int, tags: Option[String]) extends Serializable
+case class Posting(postingType: Int, id: Int, acceptedAnswer: Option[Int], parentId: Option[QID], score: Int,  tags: Option[String]) extends Serializable   
+                   
+                   
+                   
+                  
 
 
 /** The main class */
@@ -20,16 +26,16 @@ object StackOverflow extends StackOverflow {
   /** Main function */
   def main(args: Array[String]): Unit = {
 
-    val lines   = sc.textFile("src/main/resources/stackoverflow/stackoverflow.csv")
+    val lines   = sc.textFile("src/main/ressources/stackoverflow/stackoverflow.csv").persist()
     val raw     = rawPostings(lines)
     val grouped = groupedPostings(raw)
     val scored  = scoredPostings(grouped)
     val vectors = vectorPostings(scored)
-//    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
-
+    //assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
     val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
     val results = clusterResults(means, vectors)
     printResults(results)
+
   }
 }
 
@@ -65,11 +71,12 @@ class StackOverflow extends Serializable {
 
   /** Load postings from the given file */
   def rawPostings(lines: RDD[String]): RDD[Posting] =
+
     lines.map(line => {
       val arr = line.split(",")
       Posting(postingType =    arr(0).toInt,
               id =             arr(1).toInt,
-              acceptedAnswer = if (arr(2) == "") None else Some(arr(2).toInt),
+              acceptedAnswer = if (arr(2) == "") None else Option(arr(2).toInt),
               parentId =       if (arr(3) == "") None else Some(arr(3).toInt),
               score =          arr(4).toInt,
               tags =           if (arr.length >= 6) Some(arr(5).intern()) else None)
@@ -77,15 +84,18 @@ class StackOverflow extends Serializable {
 
 
   /** Group the questions and answers together */
-  def groupedPostings(postings: RDD[Posting]): RDD[(QID, Iterable[(Question, Answer)])] = {
-    ???
+  def groupedPostings(postings: RDD[Posting]): RDD[(QID, Iterable[(Question, Answer)])] ={
+
+    val questions = postings.filter(_.postingType == 1).map(post=>(post.id, post))
+    val answers = postings.filter(_.postingType ==  2).map(post=>(post.parentId.get, post))
+    questions.join(answers).groupByKey().persist()
+
   }
 
 
   /** Compute the maximum score for each posting */
   def scoredPostings(grouped: RDD[(QID, Iterable[(Question, Answer)])]): RDD[(Question, HighScore)] = {
-
-    def answerHighScore(as: Array[Answer]): HighScore = {
+    def answerHighScore(as: Array[Posting]): Int = {
       var highScore = 0
           var i = 0
           while (i < as.length) {
@@ -96,8 +106,10 @@ class StackOverflow extends Serializable {
           }
       highScore
     }
-
-    ???
+    grouped.map { case (_, iterable) =>
+      (iterable.head._1, answerHighScore(iterable.map(_._2).toArray))
+    }
+     // grouped.map(l=>(l._2.head._1, answerHighScore(l._2.toArray.map(a=> a._2)))).persist()
   }
 
 
@@ -117,7 +129,7 @@ class StackOverflow extends Serializable {
       }
     }
 
-    ???
+    scored.map(score=>(firstLangInTag(score._1.tags, langs).getOrElse(0)*langSpread, score._2)).persist()
   }
 
 
@@ -172,7 +184,11 @@ class StackOverflow extends Serializable {
 
   /** Main kmeans computation */
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
-    val newMeans = means.clone() // you need to compute newMeans
+    //val newMeans = means.clone()
+    // you need to compute newMeans
+    val closest = vectors.map(vector => (findClosest(vector, means), vector))
+    val updatedMeans = closest.groupByKey().mapValues(averageVectors).collect().toMap
+    val newMeans = means.indices.map(i => updatedMeans.getOrElse(i, means(i))).toArray
 
     // TODO: Fill in the newMeans array
     val distance = euclideanDistance(means, newMeans)
@@ -198,8 +214,6 @@ class StackOverflow extends Serializable {
       newMeans
     }
   }
-
-
 
 
   //
@@ -275,10 +289,24 @@ class StackOverflow extends Serializable {
     val closestGrouped = closest.groupByKey()
 
     val median = closestGrouped.mapValues { vs =>
-      val langLabel: String   = ??? // most common language in the cluster
-      val langPercent: Double = ??? // percent of the questions in the most common language
-      val clusterSize: Int    = ???
-      val medianScore: Int    = ???
+      val grouped: Map[Int, Int] = vs
+        .map(_._1 / langSpread) // recomute original index by dividing by the langSpread
+        .groupBy(identity) // group by the index
+        .mapValues(_.size) // get sizes
+    // get maximum tuple based on size of the group
+    val maxLangIndex = grouped.maxBy(_._2)._1
+
+      // most common language in the cluster
+      val langLabel: String = langs(maxLangIndex)
+
+      val langPercent: Double = grouped(maxLangIndex) * 100.0d / vs.size // percent of the questions in the most common language
+    val clusterSize: Int = vs.size
+      val sortedScores: List[Int] = vs.map(_._2).toList.sorted
+      val middle = clusterSize / 2 // rounds down 3/2 = 1 4/2 = 2 5/2 =2
+    val medianScore: Int = if (clusterSize % 2 == 0)
+      (sortedScores(middle - 1) + sortedScores(middle)) / 2
+    else
+      sortedScores(middle)
 
       (langLabel, langPercent, clusterSize, medianScore)
     }
@@ -286,7 +314,7 @@ class StackOverflow extends Serializable {
     median.collect().map(_._2).sortBy(_._4)
   }
 
-  def printResults(results: Array[(String, Double, Int, Int)]): Unit = {
+      def printResults(results: Array[(String, Double, Int, Int)]): Unit = {
     println("Resulting clusters:")
     println("  Score  Dominant language (%percent)  Questions")
     println("================================================")
